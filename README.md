@@ -35,14 +35,63 @@ curl -s -X POST localhost:3000/agent/run \
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/health` | — | `{"status":"ok"}` (never needs auth) |
-| POST | `/agent/run` | `{prompt, model?, system_prompt?, max_turns?, allowed_tools?, cwd?}` | `{session_id, result, is_error, subtype, num_turns, duration_ms, total_cost_usd, message_count}` |
-| POST | `/agent/stream` | same as `/agent/run` | Server-Sent Events: one event per message (`assistant`, `result`, ...), then `done` |
+| POST | `/agent/run` | `{prompt, model?, system_prompt?, max_turns?, allowed_tools?, cwd?, session_id?, keep_session?}` | `{session_id, result, is_error, subtype, num_turns, duration_ms, total_cost_usd, message_count, session_reused, session_kept}` |
+| POST | `/agent/stream` | same as `/agent/run` | Server-Sent Events: one event per message (`assistant`, `result`, ...), `error` on failure, then always `done` with `{session_id, session_kept}` |
+| GET | `/agent/sessions` | — | `{count, max_sessions, running, max_concurrent_runs, sessions: [{id, idle_secs}]}` |
+| DELETE | `/agent/sessions/{id}` | — | `204`; the session's process exits |
 | POST | `/messages` | a Messages API request body | the Messages API response, verbatim |
 | POST | `/messages/complete` | `{prompt, model?, max_tokens?}` | `{"text": "..."}` |
 
-Errors are JSON: `{"error": "..."}` with a meaningful status (400 bad request,
-401 no/bad token, 403 disallowed `cwd`, 502 the agent or API failed, 503 the
-server has no API key for `/messages`).
+Errors are JSON: `{"error": "..."}` with a meaningful status: 400 bad request,
+401 no/bad token, 403 disallowed `cwd`, 404 unknown/expired session, 409 the
+session is busy with another turn, 429 too many concurrent runs (retry later),
+502 the agent or API failed, 503 the server has no API key for `/messages`,
+504 the turn exceeded the run timeout (its process was terminated).
+
+### Sessions: keep the process between turns
+
+Every fresh agent run spawns the `claude` CLI, which costs a couple of seconds
+and a few hundred MB before the first token, and starts a new conversation. To
+avoid both, keep the session:
+
+```bash
+# First turn: keep the process alive afterwards.
+curl -s -X POST localhost:3000/agent/run -H 'content-type: application/json' \
+  -d '{"prompt": "Read src/main.rs and remember its structure.", "allowed_tools": ["Read"], "keep_session": true}'
+# -> {"session_id": "6c1e...", "session_kept": true, ...}
+
+# Follow-up: same process, same conversation, no spawn.
+curl -s -X POST localhost:3000/agent/run -H 'content-type: application/json' \
+  -d '{"prompt": "Now summarize what main() does.", "session_id": "6c1e..."}'
+# -> {"session_reused": true, "session_kept": true, ...}
+
+# Done with it (or let it expire after AGENT_SESSION_TTL_SECS idle).
+curl -s -X DELETE localhost:3000/agent/sessions/6c1e...
+```
+
+`keep_session` defaults to `true` when `session_id` is given and `false`
+otherwise, so one-shot calls stay one-shot. Note that `total_cost_usd` is the
+CLI's figure, which is cumulative over the session, not per turn. A session's options (model, tools,
+cwd, ...) are fixed when it starts; follow-up turns only use `prompt`. A
+session runs one turn at a time (a concurrent turn gets `409`), and a turn that
+times out or errors evicts its session, since its state can't be trusted.
+
+### Capacity
+
+Agent runs are bounded by the server, not by whoever sends requests:
+
+- **Concurrency**: at most `AGENT_MAX_CONCURRENT` turns run at once. Beyond
+  that a request gets `429` immediately rather than queueing, so load is
+  visible to the caller and memory stays bounded (each run is a `claude`
+  process of roughly 200–300 MB).
+- **Run timeout**: a turn is cut off at `AGENT_RUN_TIMEOUT_SECS` with `504`
+  and its process terminated, so a stuck run can't hold a slot forever.
+- **Kept sessions**: at most `AGENT_MAX_SESSIONS` live, reclaimed after
+  `AGENT_SESSION_TTL_SECS` idle. `GET /agent/sessions` shows the live set and
+  the current load.
+- **Shutdown**: on SIGINT/SIGTERM the server stops accepting, lets in-flight
+  turns finish (bounded by the run timeout), then closes every kept session,
+  so no `claude` process is orphaned.
 
 ## Configuration
 
@@ -59,6 +108,10 @@ All via environment variables (a `.env` file is loaded if present):
 | `AGENT_ALLOWED_TOOLS` | none | Default tools allowed without prompting (comma-separated). |
 | `AGENT_RUNTIME_ALLOW_CWD` | off | Let clients set the agent's working directory. |
 | `AGENT_MODEL` | CLI default | Default model for runs and completions. |
+| `AGENT_MAX_CONCURRENT` | `4` | Agent turns that may run at once; more get `429`. |
+| `AGENT_RUN_TIMEOUT_SECS` | `600` | Wall-clock limit per turn; longer gets `504` and the process is terminated. |
+| `AGENT_SESSION_TTL_SECS` | `300` | Idle time after which a kept session's process is reclaimed. |
+| `AGENT_MAX_SESSIONS` | `32` | Most kept sessions (idle-but-live processes) at once. |
 
 ### Security posture
 
@@ -67,7 +120,14 @@ conservative: the server binds to loopback, clients cannot change the
 permission mode or (unless enabled) the working directory, and nothing that
 would prompt a human is approved non-interactively unless the operator allows
 it via `AGENT_PERMISSION_MODE`/`AGENT_ALLOWED_TOOLS`. Set `AGENT_RUNTIME_TOKEN`
-before exposing it beyond localhost, and put it behind TLS.
+before exposing it beyond localhost, and put it behind TLS. The token check is
+constant-time, and the concurrency and timeout limits above mean a flood of
+requests degrades into `429`s rather than into an unbounded number of
+processes.
+
+The direct `/messages` routes retry transient upstream failures (`429`, `529`
+overloaded, other `5xx`, connection errors) twice with backoff, honouring
+`retry-after`, and time out rather than hanging on a dead connection.
 
 ## Use the SDK directly
 

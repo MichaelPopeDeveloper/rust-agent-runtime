@@ -17,6 +17,7 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod routes;
+pub mod sessions;
 
 pub use config::Config;
-pub use routes::app;
+pub use routes::{AppState, app, build};

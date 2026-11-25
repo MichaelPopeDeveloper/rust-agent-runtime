@@ -11,7 +11,9 @@ Protocol it implements:
   * exits 0 when stdin closes.
 
 It also honors an env var CLAUDE_FAKE_EXIT_NONZERO=1 to exit non-zero after the
-first result (to test error propagation), emitting an error result first.
+first result (to test error propagation), emitting an error result first, and
+a prompt starting with "HANG" makes it echo the assistant turn and then never
+send a result (to test timeouts and cancellation).
 """
 import json
 import os
@@ -100,6 +102,9 @@ def main():
                 "session_id": "fake-session",
                 "uuid": f"assistant-{turns}",
             })
+            if content.startswith("HANG"):
+                # A stuck run: progress was made, but no result ever comes.
+                continue
             if os.environ.get("CLAUDE_FAKE_EXIT_NONZERO") == "1":
                 emit({
                     "type": "result",

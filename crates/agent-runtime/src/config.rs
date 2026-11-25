@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use claude_agent_sdk::PermissionMode;
 
@@ -39,6 +40,20 @@ pub struct Config {
     pub allow_cwd: bool,
     /// Default model for agent runs and completions (`AGENT_MODEL`).
     pub default_model: Option<String>,
+    /// Maximum agent turns running at once (`AGENT_MAX_CONCURRENT`, default
+    /// 4). Each run is a `claude` process of a few hundred MB, so this is the
+    /// knob that bounds memory; requests beyond it get `429`.
+    pub max_concurrent_runs: usize,
+    /// Wall-clock limit for one turn (`AGENT_RUN_TIMEOUT_SECS`, default 600).
+    /// A turn that exceeds it is cancelled, its process terminated, and the
+    /// client gets `504`.
+    pub run_timeout: Duration,
+    /// How long a kept session may sit idle before its process is reclaimed
+    /// (`AGENT_SESSION_TTL_SECS`, default 300).
+    pub session_ttl: Duration,
+    /// Maximum kept sessions, i.e. idle-but-live `claude` processes
+    /// (`AGENT_MAX_SESSIONS`, default 32).
+    pub max_sessions: usize,
 }
 
 impl Default for Config {
@@ -53,6 +68,10 @@ impl Default for Config {
             default_allowed_tools: Vec::new(),
             allow_cwd: false,
             default_model: None,
+            max_concurrent_runs: 4,
+            run_timeout: Duration::from_secs(600),
+            session_ttl: Duration::from_secs(300),
+            max_sessions: 32,
         }
     }
 }
@@ -93,6 +112,30 @@ impl Config {
             Some("1") | Some("true") | Some("yes")
         );
         config.default_model = non_empty(std::env::var("AGENT_MODEL").ok());
+        if let Some(n) = non_empty(std::env::var("AGENT_MAX_CONCURRENT").ok()) {
+            config.max_concurrent_runs = n
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| format!("invalid AGENT_MAX_CONCURRENT: {n:?}"))?;
+        }
+        if let Some(secs) = non_empty(std::env::var("AGENT_RUN_TIMEOUT_SECS").ok()) {
+            config.run_timeout = Duration::from_secs(
+                secs.parse()
+                    .map_err(|_| format!("invalid AGENT_RUN_TIMEOUT_SECS: {secs:?}"))?,
+            );
+        }
+        if let Some(secs) = non_empty(std::env::var("AGENT_SESSION_TTL_SECS").ok()) {
+            config.session_ttl = Duration::from_secs(
+                secs.parse()
+                    .map_err(|_| format!("invalid AGENT_SESSION_TTL_SECS: {secs:?}"))?,
+            );
+        }
+        if let Some(n) = non_empty(std::env::var("AGENT_MAX_SESSIONS").ok()) {
+            config.max_sessions = n
+                .parse()
+                .map_err(|_| format!("invalid AGENT_MAX_SESSIONS: {n:?}"))?;
+        }
         Ok(config)
     }
 }

@@ -13,7 +13,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1963,6 +1965,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
