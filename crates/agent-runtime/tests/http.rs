@@ -41,6 +41,7 @@ async fn serve(router: Router) -> String {
 fn test_config() -> Config {
     Config {
         cli_path: Some(fake_cli()),
+        warm_spares: 0,
         ..Config::default()
     }
 }
@@ -195,6 +196,14 @@ fn mock_upstream(hits: Arc<AtomicUsize>, failures: usize) -> Router {
             "must not send Authorization"
         );
         assert_eq!(body["messages"][0]["content"], "Hello, Claude!");
+        if body["stream"] == true {
+            return (
+                [("content-type", "text/event-stream")],
+                "event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
+                 event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )
+                .into_response();
+        }
         if hit <= upstream.failures {
             return (
                 axum::http::StatusCode::from_u16(529).unwrap(),
@@ -665,4 +674,217 @@ async fn a_disconnected_stream_consumer_frees_the_slot() {
     // Well within the 5 s the poll allows, far below the 30 s run timeout.
     wait_for_running(&base, 0).await;
     assert!(state.pool.is_empty());
+}
+
+/// A `"stream": true` passthrough relays the upstream event stream as-is
+/// (status and content type included) instead of trying to parse it as one
+/// JSON document.
+#[tokio::test]
+async fn messages_passthrough_relays_a_stream() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = serve(mock_upstream(hits.clone(), 0)).await;
+    let base = serve(app(Config {
+        anthropic_api_key: Some("test-key".into()),
+        anthropic_base_url: upstream,
+        ..Config::default()
+    }))
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{base}/messages"))
+        .json(&json!({
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello, Claude!"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+    let body = response.text().await.unwrap();
+    assert!(body.contains("event: message_start"), "{body}");
+    assert!(body.contains("event: message_stop"), "{body}");
+}
+
+/// Every error, including a malformed body or an unknown route, has the
+/// same `{"error": ...}` shape.
+#[tokio::test]
+async fn errors_are_always_json() {
+    let base = serve(app(test_config())).await;
+    let client = reqwest::Client::new();
+    let malformed = client
+        .post(format!("{base}/agent/run"))
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+    let body: Value = malformed.json().await.unwrap();
+    assert!(body["error"].is_string(), "{body}");
+
+    let missing = client.get(format!("{base}/nope")).send().await.unwrap();
+    assert_eq!(missing.status(), 404);
+    let body: Value = missing.json().await.unwrap();
+    assert_eq!(body["error"], "no such route");
+}
+
+/// Poll `/agent/sessions` until `ready` warm spares are standing by.
+async fn wait_for_warm(base: &str, ready: u64) {
+    for _ in 0..500 {
+        if sessions(base).await["warm_spares"]["ready"] == ready {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never saw {ready} warm spare(s): {}", sessions(base).await);
+}
+
+/// With warm spares on, a fresh run with default options is served by a
+/// pre-spawned process; one with overrides still spawns its own.
+#[tokio::test]
+async fn warm_spares_serve_default_runs() {
+    if !have_python() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let (base, state) = serve_built(Config {
+        warm_spares: 1,
+        ..test_config()
+    })
+    .await;
+    // Nothing is warmed until the agent routes are used.
+    assert_eq!(state.warm.ready(), 0);
+
+    // The first run spawns its own process and starts the warming, even
+    // though its override means it could not have used a spare itself.
+    let first: Value = run(&base, json!({"prompt": "one", "max_turns": 3}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["result"], "echo: one");
+    wait_for_warm(&base, 1).await;
+    let stats = sessions(&base).await["stats"].clone();
+    assert_eq!(stats["fresh_spawns"], 1);
+    assert_eq!(stats["warm_hits"], 0);
+
+    // A default-options run is served warm, and the pool refills behind it.
+    let second: Value = run(&base, json!({"prompt": "two"}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["result"], "echo: two");
+    let stats = sessions(&base).await["stats"].clone();
+    assert_eq!(stats["warm_hits"], 1);
+    wait_for_warm(&base, 1).await;
+
+    // Overrides can't use a spare built with the defaults.
+    let third: Value = run(
+        &base,
+        json!({"prompt": "three", "system_prompt": "be terse"}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(third["result"], "echo: three");
+    let stats = sessions(&base).await["stats"].clone();
+    assert_eq!(stats["fresh_spawns"], 2);
+    assert_eq!(stats["warm_hits"], 1);
+    assert_eq!(state.warm.ready(), 1, "the spare is still there");
+
+    // And a spare works as a kept session too.
+    let fourth: Value = run(&base, json!({"prompt": "four", "keep_session": true}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fourth["session_kept"], true);
+    let stats = sessions(&base).await["stats"].clone();
+    assert_eq!(stats["warm_hits"], 2);
+    assert_eq!(stats["runs_completed"], 4);
+    assert_eq!(state.pool.len(), 1);
+}
+
+/// With a queue wait configured, a request at the concurrency limit waits for
+/// a slot instead of being rejected at once.
+#[tokio::test]
+async fn queued_requests_wait_for_a_slot() {
+    if !have_python() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let (base, _state) = serve_built(Config {
+        max_concurrent_runs: 1,
+        run_timeout: Duration::from_secs(1),
+        queue_wait: Duration::from_secs(10),
+        ..test_config()
+    })
+    .await;
+    let hung = {
+        let base = base.clone();
+        tokio::spawn(async move { run(&base, json!({"prompt": "HANG"})).await })
+    };
+    wait_for_running(&base, 1).await;
+
+    let started = std::time::Instant::now();
+    let queued = run(&base, json!({"prompt": "after you"})).await;
+    assert_eq!(queued.status(), 200, "{}", queued.text().await.unwrap());
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "waited for the slot: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(hung.await.unwrap().status(), 504);
+    let stats = sessions(&base).await["stats"].clone();
+    assert_eq!(stats["rejected_busy"], 0);
+    assert_eq!(stats["runs_timed_out"], 1);
+}
+
+/// A follow-up turn may switch the kept session's model; later turns keep it.
+#[tokio::test]
+async fn reused_sessions_can_switch_model() {
+    if !have_python() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let (base, _state) = serve_built(test_config()).await;
+    let first: Value = run(&base, json!({"prompt": "one", "keep_session": true}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["model"], "claude-fake");
+    let id = first["session_id"].as_str().unwrap().to_string();
+
+    let second: Value = run(
+        &base,
+        json!({"prompt": "two", "session_id": id, "model": "claude-fake-fast"}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(second["model"], "claude-fake-fast");
+    assert_eq!(second["session_reused"], true);
+
+    let third: Value = run(&base, json!({"prompt": "three", "session_id": id}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(third["model"], "claude-fake-fast", "the switch sticks");
+    assert_eq!(third["num_turns"], 3);
 }

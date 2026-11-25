@@ -13,7 +13,8 @@ Protocol it implements:
 It also honors an env var CLAUDE_FAKE_EXIT_NONZERO=1 to exit non-zero after the
 first result (to test error propagation), emitting an error result first, and
 a prompt starting with "HANG" makes it echo the assistant turn and then never
-send a result (to test timeouts and cancellation).
+send a result (to test timeouts and cancellation). `set_model` control requests
+change the model reported on later assistant turns.
 """
 import json
 import os
@@ -28,12 +29,16 @@ def emit(obj):
 def main():
     # Prove the SDK passes our env through and sets the entrypoint.
     entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    default_model = os.environ.get("CLAUDE_FAKE_MODEL", "claude-fake")
+    # Honors `set_model` control requests, like the real CLI, and reports the
+    # current model on every assistant turn.
+    current_model = default_model
     emit({
         "type": "system",
         "subtype": "init",
         "session_id": "fake-session",
         "uuid": "init-uuid",
-        "model": os.environ.get("CLAUDE_FAKE_MODEL", "claude-fake"),
+        "model": default_model,
         "cwd": os.getcwd(),
         "tools": [],
         "mcp_servers": [],
@@ -76,6 +81,8 @@ def main():
                     },
                 })
             else:
+                if req.get("subtype") == "set_model":
+                    current_model = req.get("model") or default_model
                 emit({
                     "type": "control_response",
                     "response": {
@@ -96,7 +103,7 @@ def main():
             emit({
                 "type": "assistant",
                 "message": {
-                    "model": "claude-fake",
+                    "model": current_model,
                     "content": [{"type": "text", "text": f"echo: {content}"}],
                 },
                 "session_id": "fake-session",

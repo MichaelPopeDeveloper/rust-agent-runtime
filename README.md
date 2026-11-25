@@ -35,14 +35,15 @@ curl -s -X POST localhost:3000/agent/run \
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/health` | — | `{"status":"ok"}` (never needs auth) |
-| POST | `/agent/run` | `{prompt, model?, system_prompt?, max_turns?, allowed_tools?, cwd?, session_id?, keep_session?}` | `{session_id, result, is_error, subtype, num_turns, duration_ms, total_cost_usd, message_count, session_reused, session_kept}` |
+| POST | `/agent/run` | `{prompt, model?, system_prompt?, max_turns?, allowed_tools?, cwd?, session_id?, keep_session?}` | `{session_id, result, is_error, subtype, num_turns, duration_ms, total_cost_usd, model, message_count, session_reused, session_kept}` |
 | POST | `/agent/stream` | same as `/agent/run` | Server-Sent Events: one event per message (`assistant`, `result`, ...), `error` on failure, then always `done` with `{session_id, session_kept}` |
-| GET | `/agent/sessions` | — | `{count, max_sessions, running, max_concurrent_runs, sessions: [{id, idle_secs}]}` |
+| GET | `/agent/sessions` | — | `{count, max_sessions, running, max_concurrent_runs, warm_spares: {ready, target}, stats: {...}, sessions: [{id, idle_secs}]}` |
 | DELETE | `/agent/sessions/{id}` | — | `204`; the session's process exits |
-| POST | `/messages` | a Messages API request body | the Messages API response, verbatim |
+| POST | `/messages` | a Messages API request body | the Messages API response, verbatim; with `"stream": true` the event stream is relayed as it arrives |
 | POST | `/messages/complete` | `{prompt, model?, max_tokens?}` | `{"text": "..."}` |
 
-Errors are JSON: `{"error": "..."}` with a meaningful status: 400 bad request,
+Errors are JSON: `{"error": "..."}` with a meaningful status (also for a
+malformed body or an unknown route): 400 bad request,
 401 no/bad token, 403 disallowed `cwd`, 404 unknown/expired session, 409 the
 session is busy with another turn, 429 too many concurrent runs (retry later),
 502 the agent or API failed, 503 the server has no API key for `/messages`,
@@ -71,10 +72,12 @@ curl -s -X DELETE localhost:3000/agent/sessions/6c1e...
 
 `keep_session` defaults to `true` when `session_id` is given and `false`
 otherwise, so one-shot calls stay one-shot. Note that `total_cost_usd` is the
-CLI's figure, which is cumulative over the session, not per turn. A session's options (model, tools,
-cwd, ...) are fixed when it starts; follow-up turns only use `prompt`. A
-session runs one turn at a time (a concurrent turn gets `409`), and a turn that
-times out or errors evicts its session, since its state can't be trusted.
+CLI's figure, which is cumulative over the session, not per turn. A session's
+tools, `cwd`, system prompt and turn cap are fixed when it starts; a follow-up
+may pass `model` to switch the session's model (it sticks for later turns),
+and the response's `model` says which model answered. A session runs one turn
+at a time (a concurrent turn gets `409`), and a turn that times out or errors
+evicts its session, since its state can't be trusted.
 
 ### Capacity
 
@@ -83,15 +86,30 @@ Agent runs are bounded by the server, not by whoever sends requests:
 - **Concurrency**: at most `AGENT_MAX_CONCURRENT` turns run at once. Beyond
   that a request gets `429` immediately rather than queueing, so load is
   visible to the caller and memory stays bounded (each run is a `claude`
-  process of roughly 200–300 MB).
+  process of roughly 200–300 MB). Set `AGENT_QUEUE_WAIT_SECS` to let requests
+  wait that long for a slot first, for bursty callers that would rather wait
+  than retry.
+- **Warm spares**: a fresh run normally pays 600–800 ms to spawn the CLI and
+  complete its handshake before the first token. The server keeps
+  `AGENT_WARM_SPARES` processes pre-spawned with the default options, so a
+  request without per-request overrides (`model`, `system_prompt`,
+  `max_turns`, `allowed_tools`, `cwd`) starts at once; the pool refills in the
+  background. Warming begins with the first agent request, so a deployment
+  that only uses `/messages` never pays for it. Total `claude` processes are
+  bounded by `AGENT_MAX_CONCURRENT + AGENT_MAX_SESSIONS + AGENT_WARM_SPARES`.
 - **Run timeout**: a turn is cut off at `AGENT_RUN_TIMEOUT_SECS` with `504`
   and its process terminated, so a stuck run can't hold a slot forever.
 - **Kept sessions**: at most `AGENT_MAX_SESSIONS` live, reclaimed after
   `AGENT_SESSION_TTL_SECS` idle. `GET /agent/sessions` shows the live set and
   the current load.
 - **Shutdown**: on SIGINT/SIGTERM the server stops accepting, lets in-flight
-  turns finish (bounded by the run timeout), then closes every kept session,
-  so no `claude` process is orphaned.
+  turns finish, then closes every kept session and warm spare, so no `claude`
+  process is orphaned. Each phase is bounded by `AGENT_SHUTDOWN_GRACE_SECS`;
+  anything still running after that is dropped and its process killed.
+- **Visibility**: every request is logged with method, path, status and
+  latency, and `GET /agent/sessions` reports live sessions, warm spares,
+  running turns and counters since startup (completed, failed, timed out,
+  `429`s, `409`s, warm hits vs. spawns) for tuning the limits above.
 
 ## Configuration
 
@@ -112,6 +130,9 @@ All via environment variables (a `.env` file is loaded if present):
 | `AGENT_RUN_TIMEOUT_SECS` | `600` | Wall-clock limit per turn; longer gets `504` and the process is terminated. |
 | `AGENT_SESSION_TTL_SECS` | `300` | Idle time after which a kept session's process is reclaimed. |
 | `AGENT_MAX_SESSIONS` | `32` | Most kept sessions (idle-but-live processes) at once. |
+| `AGENT_WARM_SPARES` | `1` | Pre-spawned processes for fresh runs with default options; `0` disables. |
+| `AGENT_QUEUE_WAIT_SECS` | `0` | How long a request waits for a free slot before `429`. |
+| `AGENT_SHUTDOWN_GRACE_SECS` | `30` | Time in-flight turns and process teardowns get after a shutdown signal. |
 
 ### Security posture
 

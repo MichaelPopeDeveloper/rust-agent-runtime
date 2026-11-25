@@ -47,10 +47,12 @@ impl MessagesClient {
     /// A client for `base_url` (e.g. `https://api.anthropic.com`).
     pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
-            // A hung upstream must not hang a handler forever; long enough for
-            // a large completion, short enough to notice a dead connection.
+            // A hung upstream must not hang a handler forever. The read
+            // timeout is between bytes, so a long streaming response is fine
+            // while a dead connection is noticed; ten minutes matches the
+            // official SDKs' default for a slow non-streaming completion.
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
+            .read_timeout(Duration::from_secs(600))
             .build()
             .unwrap_or_default();
         MessagesClient {
@@ -67,17 +69,18 @@ impl MessagesClient {
         self
     }
 
-    /// `POST /v1/messages` with `body` as the request, returning the parsed
-    /// response. A non-success status is returned as an [`ApiError`] carrying
-    /// the upstream status and body so the client sees the real reason;
-    /// transient failures are retried first (see the module docs).
-    pub async fn create(&self, body: &Value) -> Result<Value, ApiError> {
+    /// `POST /v1/messages` with `body` as the request, returning the raw
+    /// response once a success status arrives, retrying transient failures
+    /// first (see the module docs). The body is untouched, so a caller can
+    /// relay a streaming response as it arrives; [`create`](Self::create)
+    /// reads and parses it instead.
+    pub async fn send(&self, body: &Value) -> Result<reqwest::Response, ApiError> {
         let mut backoff = INITIAL_BACKOFF;
         let mut attempt = 0;
         loop {
             attempt += 1;
             let (error, retry_after) = match self.attempt(body).await {
-                Ok(value) => return Ok(value),
+                Ok(response) => return Ok(response),
                 Err(Attempt::Final(error)) => return Err(error),
                 Err(Attempt::Transient { error, retry_after }) => (error, retry_after),
             };
@@ -94,7 +97,16 @@ impl MessagesClient {
         }
     }
 
-    async fn attempt(&self, body: &Value) -> Result<Value, Attempt> {
+    /// `POST /v1/messages` with `body` as the request, returning the parsed
+    /// response. A non-success status is returned as an [`ApiError`] carrying
+    /// the upstream status and body so the client sees the real reason.
+    pub async fn create(&self, body: &Value) -> Result<Value, ApiError> {
+        let text = self.send(body).await?.text().await?;
+        serde_json::from_str(&text)
+            .map_err(|e| ApiError::upstream(format!("Messages API returned invalid JSON: {e}")))
+    }
+
+    async fn attempt(&self, body: &Value) -> Result<reqwest::Response, Attempt> {
         let response = self
             .http
             .post(format!("{}/v1/messages", self.base_url))
@@ -110,18 +122,11 @@ impl MessagesClient {
             })?;
 
         let status = response.status();
-        let retry_after = parse_retry_after(response.headers());
-        let text = response.text().await.map_err(|e| Attempt::Transient {
-            error: ApiError::from(e),
-            retry_after: None,
-        })?;
         if status.is_success() {
-            return serde_json::from_str(&text).map_err(|e| {
-                Attempt::Final(ApiError::upstream(format!(
-                    "Messages API returned invalid JSON: {e}"
-                )))
-            });
+            return Ok(response);
         }
+        let retry_after = parse_retry_after(response.headers());
+        let text = response.text().await.unwrap_or_default();
         // Pass the upstream status through for client errors (a 400 from the
         // API is the caller's problem); anything else is a gateway failure.
         let reported = if status.is_client_error() {

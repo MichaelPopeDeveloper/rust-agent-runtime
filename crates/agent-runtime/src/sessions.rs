@@ -26,15 +26,31 @@ pub struct Session {
     /// never runs two turns at once.
     pub client: Arc<Mutex<ClaudeSDKClient>>,
     last_used: StdMutex<Instant>,
+    /// The model the session currently runs with (`None`: the CLI default),
+    /// so a follow-up that asks for a different one can switch it.
+    model: StdMutex<Option<String>>,
 }
 
 impl Session {
-    pub fn new(id: String, client: Arc<Mutex<ClaudeSDKClient>>) -> Arc<Self> {
+    pub fn new(
+        id: String,
+        client: Arc<Mutex<ClaudeSDKClient>>,
+        model: Option<String>,
+    ) -> Arc<Self> {
         Arc::new(Session {
             id,
             client,
             last_used: StdMutex::new(Instant::now()),
+            model: StdMutex::new(model),
         })
+    }
+
+    pub fn model(&self) -> Option<String> {
+        self.model.lock().unwrap().clone()
+    }
+
+    pub fn set_model(&self, model: Option<String>) {
+        *self.model.lock().unwrap() = model;
     }
 
     /// Reset the idle clock.
@@ -150,7 +166,8 @@ impl SessionPool {
     }
 
     /// Disconnect every session (used on shutdown, so no CLI process is
-    /// orphaned when the server exits).
+    /// orphaned when the server exits). Sessions close concurrently, so this
+    /// takes about as long as the slowest process exit, not the sum.
     pub async fn shutdown_all(&self) {
         let all: Vec<Arc<Session>> = self
             .sessions
@@ -159,9 +176,7 @@ impl SessionPool {
             .drain()
             .map(|(_, s)| s)
             .collect();
-        for session in all {
-            session.close().await;
-        }
+        futures::future::join_all(all.iter().map(|session| session.close())).await;
     }
 
     /// Run idle eviction periodically in the background (needs a tokio

@@ -214,6 +214,18 @@ impl ClaudeSDKClient {
         self.rx = None;
     }
 
+    /// Whether the session is connected and its CLI process is still running.
+    ///
+    /// `false` before `connect`, after `disconnect`, and as soon as the process
+    /// has exited or closed its output (its message stream has ended), which
+    /// makes this a cheap liveness check before reusing an idle client. It
+    /// does not send anything to the process.
+    pub fn is_connected(&self) -> bool {
+        // The engine's reader task is the only holder of the channel's sender;
+        // it ends, dropping the sender, exactly when the stream ends.
+        self.engine.is_some() && self.rx.as_ref().is_some_and(|rx| !rx.is_closed())
+    }
+
     /// The CLI's `initialize` response (available commands, output styles,
     /// models, account info, ...), or `None` before `connect`.
     pub fn server_info(&self) -> Option<Value> {

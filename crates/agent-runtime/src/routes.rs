@@ -5,9 +5,9 @@
 //! | GET    | `/health`              | Liveness check (never requires auth)             |
 //! | POST   | `/agent/run`           | Run one agent turn, return the final result      |
 //! | POST   | `/agent/stream`        | Same, streaming every message as SSE             |
-//! | GET    | `/agent/sessions`      | Kept sessions and current load                   |
+//! | GET    | `/agent/sessions`      | Kept sessions, warm spares, load and counters    |
 //! | DELETE | `/agent/sessions/{id}` | Close a kept session                             |
-//! | POST   | `/messages`            | Direct Messages API passthrough                  |
+//! | POST   | `/messages`            | Direct Messages API passthrough (streams too)    |
 //! | POST   | `/messages/complete`   | One prompt in, assistant text out                |
 //!
 //! Agent runs are driven by `claude_agent_sdk`; the server operator controls
@@ -17,25 +17,28 @@
 //! # Capacity
 //!
 //! Every agent turn is a `claude` process of a few hundred MB, so the service
-//! bounds them. At most `max_concurrent_runs` turns run at once (beyond that a
-//! request gets `429` immediately rather than queueing), each turn is cut off
-//! at `run_timeout` (`504`, process terminated), and a caller may keep a
-//! session alive between turns (`keep_session`) so a follow-up skips the
-//! process spawn and the `initialize` handshake and keeps the conversation.
-//! Kept sessions are capped (`max_sessions`) and reclaimed after
-//! `session_ttl` idle.
+//! bounds them. At most `max_concurrent_runs` turns run at once; beyond that a
+//! request waits up to `queue_wait` for a slot (zero by default) and then gets
+//! `429`. Each turn is cut off at `run_timeout` (`504`, process terminated).
+//! A caller may keep a session alive between turns (`keep_session`) so a
+//! follow-up skips the process spawn and the `initialize` handshake and keeps
+//! the conversation; kept sessions are capped (`max_sessions`) and reclaimed
+//! after `session_ttl` idle. Fresh runs that use the server's default options
+//! are served from pre-spawned warm spares (`warm_spares`) when one is ready.
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Request, State};
+use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use claude_agent_sdk::{ClaudeAgentOptions, ClaudeSDKClient, ContentBlock, Message, ResultMessage};
 use futures::StreamExt;
@@ -44,11 +47,59 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::task::TaskTracker;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 use crate::api::MessagesClient;
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::sessions::{Session, SessionPool};
+use crate::warm::WarmPool;
+
+/// Counters since startup, for capacity tuning. Read via `GET /agent/sessions`.
+#[derive(Debug, Default)]
+pub struct Stats {
+    /// Turns that got a slot (whatever happened next).
+    pub runs_started: AtomicU64,
+    pub runs_completed: AtomicU64,
+    /// Turns that failed: SDK error, process died, or could not start.
+    pub runs_failed: AtomicU64,
+    pub runs_timed_out: AtomicU64,
+    /// Streaming turns abandoned because the consumer went away.
+    pub runs_abandoned: AtomicU64,
+    /// `429`s.
+    pub rejected_busy: AtomicU64,
+    /// `409`s.
+    pub rejected_conflict: AtomicU64,
+    /// Turns that ran in a kept session.
+    pub sessions_reused: AtomicU64,
+    /// Fresh runs served by a warm spare.
+    pub warm_hits: AtomicU64,
+    /// Fresh runs that had to spawn a process.
+    pub fresh_spawns: AtomicU64,
+}
+
+impl Stats {
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> Value {
+        let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        json!({
+            "runs_started": get(&self.runs_started),
+            "runs_completed": get(&self.runs_completed),
+            "runs_failed": get(&self.runs_failed),
+            "runs_timed_out": get(&self.runs_timed_out),
+            "runs_abandoned": get(&self.runs_abandoned),
+            "rejected_busy": get(&self.rejected_busy),
+            "rejected_conflict": get(&self.rejected_conflict),
+            "sessions_reused": get(&self.sessions_reused),
+            "warm_hits": get(&self.warm_hits),
+            "fresh_spawns": get(&self.fresh_spawns),
+        })
+    }
+}
 
 /// Shared server state.
 pub struct AppState {
@@ -56,10 +107,13 @@ pub struct AppState {
     pub messages: Option<MessagesClient>,
     /// Sessions kept alive between turns.
     pub pool: Arc<SessionPool>,
+    /// Pre-spawned processes for fresh runs with default options.
+    pub warm: Arc<WarmPool>,
+    pub stats: Stats,
     /// One permit per turn that may run at once.
     run_slots: Arc<Semaphore>,
-    /// Background tasks that own a `claude` process (streaming turns and
-    /// process teardowns), waited on at shutdown so none is orphaned.
+    /// Background tasks that own a `claude` process (streaming turns, process
+    /// teardowns, warm-ups), waited on at shutdown so none is orphaned.
     tasks: TaskTracker,
 }
 
@@ -72,10 +126,11 @@ impl AppState {
             .saturating_sub(self.run_slots.available_permits())
     }
 
-    /// Close every kept session and wait for in-flight background work, so no
-    /// `claude` process outlives the server.
+    /// Close every kept session and warm spare and wait for in-flight
+    /// background work, so no `claude` process outlives the server.
     pub async fn shutdown(&self) {
         self.pool.shutdown_all().await;
+        self.warm.shutdown_all().await;
         self.tasks.close();
         self.tasks.wait().await;
     }
@@ -89,27 +144,42 @@ pub fn build(config: Config) -> (Router, Arc<AppState>) {
         .map(|key| MessagesClient::new(key, &config.anthropic_base_url));
     let pool = SessionPool::new(config.session_ttl, config.max_sessions);
     pool.spawn_reaper();
+    let tasks = TaskTracker::new();
+    let warm = WarmPool::new(default_options(&config), config.warm_spares, tasks.clone());
     let run_slots = Arc::new(Semaphore::new(config.max_concurrent_runs.max(1)));
     let state = Arc::new(AppState {
         config,
         messages,
         pool,
+        warm,
+        stats: Stats::default(),
         run_slots,
-        tasks: TaskTracker::new(),
+        tasks,
     });
 
-    let protected = Router::new()
+    // One line per request with method, path, status and latency (at INFO so
+    // it shows under the default filter). `/health` and the status read-out
+    // are left out: they are what monitors poll.
+    let traced = Router::new()
         .route("/agent/run", post(run_agent))
         .route("/agent/stream", post(stream_agent))
-        .route("/agent/sessions", get(list_sessions))
         .route("/agent/sessions/{id}", delete(close_session))
         .route("/messages", post(messages_passthrough))
         .route("/messages/complete", post(messages_complete))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        );
+    let protected = Router::new()
+        .merge(traced)
+        .route("/agent/sessions", get(list_sessions))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     let router = Router::new()
         .route("/health", get(health))
         .merge(protected)
+        .fallback(not_found)
         .with_state(state.clone());
     (router, state)
 }
@@ -121,6 +191,27 @@ pub fn app(config: Config) -> Router {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": "agent-runtime" }))
+}
+
+async fn not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "no such route")
+}
+
+/// `axum::Json`, but a malformed body gets this API's `{"error": ...}` shape
+/// instead of axum's plain-text rejection.
+pub struct ApiJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(request, state).await?;
+        Ok(ApiJson(value))
+    }
 }
 
 /// Bearer-token check for everything but `/health`, active only when a token
@@ -152,11 +243,12 @@ async fn require_token(
 // ---------------------------------------------------------------------------
 
 /// Request body for `/agent/run` and `/agent/stream`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct AgentRequest {
     /// The prompt to run.
     pub prompt: String,
-    /// Model override (falls back to the server's `AGENT_MODEL`).
+    /// Model override (falls back to the server's `AGENT_MODEL`). On a kept
+    /// session this switches the session's model for this and later turns.
     #[serde(default)]
     pub model: Option<String>,
     /// A custom system prompt (replaces Claude Code's default).
@@ -172,8 +264,9 @@ pub struct AgentRequest {
     #[serde(default)]
     pub cwd: Option<String>,
     /// Continue a kept session instead of starting a new process. A session's
-    /// options are fixed when it starts, so the fields above are ignored on a
-    /// follow-up turn.
+    /// options other than `model` are fixed when it starts, so
+    /// `system_prompt`, `max_turns`, `allowed_tools` and `cwd` are ignored on
+    /// a follow-up turn.
     #[serde(default)]
     pub session_id: Option<String>,
     /// Keep the session's process alive after this turn for follow-ups.
@@ -185,6 +278,15 @@ pub struct AgentRequest {
 impl AgentRequest {
     fn keep_session(&self) -> bool {
         self.keep_session.unwrap_or(self.session_id.is_some())
+    }
+
+    /// Whether a warm spare (built with the server defaults) can serve this.
+    fn uses_default_options(&self) -> bool {
+        self.model.is_none()
+            && self.system_prompt.is_none()
+            && self.max_turns.is_none()
+            && self.allowed_tools.is_none()
+            && self.cwd.is_none()
     }
 }
 
@@ -199,7 +301,10 @@ pub struct AgentRunResponse {
     pub subtype: String,
     pub num_turns: i64,
     pub duration_ms: i64,
+    /// The CLI's figure, cumulative over a kept session.
     pub total_cost_usd: Option<f64>,
+    /// The model that answered (from the last assistant message).
+    pub model: Option<String>,
     /// How many messages the turn produced.
     pub message_count: usize,
     /// Whether this turn ran in an existing kept session.
@@ -208,8 +313,13 @@ pub struct AgentRunResponse {
     pub session_kept: bool,
 }
 
-fn agent_options(state: &AppState, req: &AgentRequest) -> Result<ClaudeAgentOptions, ApiError> {
-    let config = &state.config;
+/// The options a run gets with no per-request overrides (what warm spares
+/// are built with).
+fn default_options(config: &Config) -> ClaudeAgentOptions {
+    agent_options(config, &AgentRequest::default()).expect("the default request is valid")
+}
+
+fn agent_options(config: &Config, req: &AgentRequest) -> Result<ClaudeAgentOptions, ApiError> {
     let mut builder = ClaudeAgentOptions::builder();
     if let Some(path) = &config.cli_path {
         builder = builder.cli_path(path.clone());
@@ -246,8 +356,8 @@ fn agent_options(state: &AppState, req: &AgentRequest) -> Result<ClaudeAgentOpti
 
 /// Where a turn's client came from.
 enum Origin {
-    /// A process started for this request (the shared handle is what becomes
-    /// a [`Session`] if the caller keeps it).
+    /// A process started (or taken warm) for this request; the shared handle
+    /// is what becomes a [`Session`] if the caller keeps it.
     Fresh(Arc<Mutex<ClaudeSDKClient>>),
     /// A kept session, claimed for this turn.
     Pooled(Arc<Session>),
@@ -260,12 +370,37 @@ struct Turn {
     permit: OwnedSemaphorePermit,
     client: OwnedMutexGuard<ClaudeSDKClient>,
     origin: Origin,
+    /// The model the turn runs with (recorded on the session if kept).
+    model: Option<String>,
+}
+
+/// Wait for a run slot: immediately, or up to `queue_wait`. `429` otherwise.
+async fn acquire_slot(state: &AppState) -> Result<OwnedSemaphorePermit, ApiError> {
+    let slots = state.run_slots.clone();
+    let permit = if state.config.queue_wait.is_zero() {
+        slots.try_acquire_owned().ok()
+    } else {
+        tokio::time::timeout(state.config.queue_wait, slots.acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
+    permit.ok_or_else(|| {
+        Stats::bump(&state.stats.rejected_busy);
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "too many concurrent agent runs (limit {}); retry later",
+                state.config.max_concurrent_runs
+            ),
+        )
+    })
 }
 
 /// Validate the request and claim a slot and a client, cheapest checks first:
 /// `400`/`403` for a bad request, `404` for an unknown session and `409` for
 /// a busy one cost nothing, `429` is only ever returned to a request that
-/// would otherwise have run, and the process spawn happens last.
+/// would otherwise have run, and the process spawn (if any) happens last.
 async fn claim_turn(state: &AppState, req: &AgentRequest) -> Result<Turn, ApiError> {
     if req.prompt.trim().is_empty() {
         return Err(ApiError::bad_request("prompt must not be empty"));
@@ -281,33 +416,68 @@ async fn claim_turn(state: &AppState, req: &AgentRequest) -> Result<Turn, ApiErr
                 ApiError::new(StatusCode::NOT_FOUND, "unknown or expired session")
             })?;
             let client = session.try_lock().ok_or_else(|| {
+                Stats::bump(&state.stats.rejected_conflict);
                 ApiError::new(StatusCode::CONFLICT, "session is busy with another turn")
             })?;
             Target::Existing(session, client)
         }
-        None => Target::Fresh(Box::new(agent_options(state, req)?)),
+        None => Target::Fresh(Box::new(agent_options(&state.config, req)?)),
     };
-    let permit = state.run_slots.clone().try_acquire_owned().map_err(|_| {
-        ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "too many concurrent agent runs (limit {}); retry later",
-                state.config.max_concurrent_runs
-            ),
-        )
-    })?;
+    let permit = acquire_slot(state).await?;
+    Stats::bump(&state.stats.runs_started);
     match target {
         Target::Existing(session, client) => {
+            Stats::bump(&state.stats.sessions_reused);
+            // A follow-up may switch the model; the other options are baked
+            // into the process.
+            if let Some(model) = &req.model
+                && session.model().as_deref() != Some(model.as_str())
+            {
+                if let Err(err) = client.set_model(Some(model)).await {
+                    Stats::bump(&state.stats.runs_failed);
+                    state.pool.remove_exact(&session);
+                    teardown(state, permit, client);
+                    return Err(ApiError::from(err));
+                }
+                session.set_model(Some(model.clone()));
+            }
             session.touch();
+            let model = session.model();
             Ok(Turn {
                 permit,
                 client,
                 origin: Origin::Pooled(session),
+                model,
             })
         }
         Target::Fresh(options) => {
-            let mut client = ClaudeSDKClient::new(*options);
-            client.connect().await?;
+            let model = req
+                .model
+                .clone()
+                .or_else(|| state.config.default_model.clone());
+            // Any fresh run starts (or tops up) the warm pool; only one with
+            // the default options can use a spare.
+            let warm = if req.uses_default_options() {
+                state.warm.take()
+            } else {
+                state.warm.refill();
+                None
+            };
+            let client = match warm {
+                Some(client) => {
+                    Stats::bump(&state.stats.warm_hits);
+                    client
+                }
+                None => {
+                    Stats::bump(&state.stats.fresh_spawns);
+                    let mut client = ClaudeSDKClient::new(*options);
+                    if let Err(err) = client.connect().await {
+                        Stats::bump(&state.stats.runs_failed);
+                        return Err(ApiError::from(err));
+                    }
+                    client
+                }
+            };
             let shared = Arc::new(Mutex::new(client));
             let client = shared
                 .clone()
@@ -317,6 +487,7 @@ async fn claim_turn(state: &AppState, req: &AgentRequest) -> Result<Turn, ApiErr
                 permit,
                 client,
                 origin: Origin::Fresh(shared),
+                model,
             })
         }
     }
@@ -377,6 +548,7 @@ enum StreamFrame {
 struct Progress {
     result: ResultMessage,
     assistant_text: String,
+    model: Option<String>,
     message_count: usize,
 }
 
@@ -391,6 +563,7 @@ impl TurnOutcome {
         let Progress {
             result,
             assistant_text,
+            model,
             message_count,
         } = self.progress;
         AgentRunResponse {
@@ -401,6 +574,7 @@ impl TurnOutcome {
             num_turns: result.num_turns,
             duration_ms: result.duration_ms,
             total_cost_usd: result.total_cost_usd,
+            model,
             message_count,
             session_reused: self.reused,
             session_kept: self.kept,
@@ -417,6 +591,7 @@ async fn drive_turn(
 ) -> Result<Progress, TurnError> {
     client.query(prompt, "default").await?;
     let mut assistant_text = String::new();
+    let mut model = None;
     let mut message_count = 0usize;
     let mut responses = client.receive_response();
     loop {
@@ -435,9 +610,14 @@ async fn drive_turn(
         let message = message?;
         message_count += 1;
         if let Message::Assistant(assistant) = &message {
-            for block in &assistant.content {
-                if let ContentBlock::Text(text) = block {
-                    assistant_text.push_str(&text.text);
+            model = Some(assistant.model.clone());
+            // The concatenated text only matters for the one-shot body; a
+            // stream consumer gets each message as it is.
+            if forward.is_none() {
+                for block in &assistant.content {
+                    if let ContentBlock::Text(text) = block {
+                        assistant_text.push_str(&text.text);
+                    }
                 }
             }
         }
@@ -454,6 +634,7 @@ async fn drive_turn(
             return Ok(Progress {
                 result,
                 assistant_text,
+                model,
                 message_count,
             });
         }
@@ -477,6 +658,7 @@ async fn execute_turn(
     let outcome = tokio::time::timeout(limit, drive_turn(&mut turn.client, prompt, forward)).await;
     match outcome {
         Ok(Ok(progress)) => {
+            Stats::bump(&state.stats.runs_completed);
             let kept = settle(state, turn, keep, &progress.result.session_id);
             Ok(TurnOutcome {
                 progress,
@@ -485,10 +667,16 @@ async fn execute_turn(
             })
         }
         Ok(Err(err)) => {
+            Stats::bump(if matches!(err, TurnError::ClientGone) {
+                &state.stats.runs_abandoned
+            } else {
+                &state.stats.runs_failed
+            });
             evict(state, turn);
             Err(err)
         }
         Err(_elapsed) => {
+            Stats::bump(&state.stats.runs_timed_out);
             evict(state, turn);
             Err(TurnError::TimedOut(limit))
         }
@@ -502,6 +690,7 @@ fn settle(state: &AppState, turn: Turn, keep: bool, session_id: &str) -> bool {
         permit,
         client,
         origin,
+        model,
     } = turn;
     if keep {
         match origin {
@@ -515,7 +704,7 @@ fn settle(state: &AppState, turn: Turn, keep: bool, session_id: &str) -> bool {
             Origin::Fresh(shared) => {
                 // Publish while still holding the lock: a request that finds
                 // the session before we unlock just sees it busy for a moment.
-                let session = Session::new(session_id.to_owned(), shared);
+                let session = Session::new(session_id.to_owned(), shared, model);
                 if state.pool.insert(session).is_ok() {
                     drop(client);
                     return true;
@@ -540,6 +729,7 @@ fn evict(state: &AppState, turn: Turn) {
         permit,
         client,
         origin,
+        ..
     } = turn;
     if let Origin::Pooled(session) = &origin {
         state.pool.remove_exact(session);
@@ -563,7 +753,7 @@ fn teardown(
 
 async fn run_agent(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AgentRequest>,
+    ApiJson(req): ApiJson<AgentRequest>,
 ) -> Result<Json<AgentRunResponse>, ApiError> {
     let turn = claim_turn(&state, &req).await?;
     let outcome = execute_turn(&state, turn, &req.prompt, req.keep_session(), None)
@@ -625,7 +815,7 @@ impl StreamFrame {
 /// terminated (a kept session can't be trusted half-consumed).
 async fn stream_agent(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AgentRequest>,
+    ApiJson(req): ApiJson<AgentRequest>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let turn = claim_turn(&state, &req).await?;
     let keep = req.keep_session();
@@ -662,7 +852,7 @@ async fn stream_agent(
     Ok(Sse::new(events).keep_alive(KeepAlive::default()))
 }
 
-/// Kept sessions and current load.
+/// Kept sessions, warm spares, current load and counters since startup.
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sessions: Vec<Value> = state
         .pool
@@ -675,6 +865,8 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Value> {
         "max_sessions": state.config.max_sessions,
         "running": state.running(),
         "max_concurrent_runs": state.config.max_concurrent_runs,
+        "warm_spares": { "ready": state.warm.ready(), "target": state.warm.target() },
+        "stats": state.stats.snapshot(),
         "sessions": sessions,
     }))
 }
@@ -713,13 +905,26 @@ fn messages_client(state: &AppState) -> Result<&MessagesClient, ApiError> {
     })
 }
 
-/// Forward a Messages API request body as-is (with the server's key).
+/// Forward a Messages API request body as-is (with the server's key). A
+/// request with `"stream": true` is proxied as it arrives, event by event,
+/// with the upstream status and content type.
 async fn messages_passthrough(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    let response = messages_client(&state)?.create(&body).await?;
-    Ok(Json(response))
+    ApiJson(body): ApiJson<Value>,
+) -> Result<Response, ApiError> {
+    let client = messages_client(&state)?;
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        let upstream = client.send(&body).await?;
+        let mut response = Response::builder().status(upstream.status());
+        if let Some(content_type) = upstream.headers().get(header::CONTENT_TYPE) {
+            response = response.header(header::CONTENT_TYPE, content_type.clone());
+        }
+        return response
+            .body(Body::from_stream(upstream.bytes_stream()))
+            .map_err(|e| ApiError::upstream(format!("could not relay the stream: {e}")));
+    }
+    let response = client.create(&body).await?;
+    Ok(Json(response).into_response())
 }
 
 /// Request body for `/messages/complete`.
@@ -739,7 +944,7 @@ fn default_max_tokens() -> u32 {
 /// One prompt in, the assistant's text out.
 async fn messages_complete(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CompleteRequest>,
+    ApiJson(req): ApiJson<CompleteRequest>,
 ) -> Result<Json<Value>, ApiError> {
     if req.prompt.trim().is_empty() {
         return Err(ApiError::bad_request("prompt must not be empty"));

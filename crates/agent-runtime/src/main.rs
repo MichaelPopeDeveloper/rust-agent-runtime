@@ -1,4 +1,5 @@
-//! Binary entry point: load `.env`, read config, serve with graceful shutdown.
+//! Binary entry point: load `.env`, read config, serve with a bounded graceful
+//! shutdown.
 
 use tracing_subscriber::EnvFilter;
 
@@ -8,24 +9,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("agent_runtime=info")),
+                .unwrap_or_else(|_| EnvFilter::new("agent_runtime=info,tower_http=info")),
         )
         .init();
 
     let config = agent_runtime::Config::from_env()?;
     let addr = config.bind;
+    let grace = config.shutdown_grace;
     let (app, state) = agent_runtime::build(config);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("agent-runtime listening on http://{addr}");
-    // Stop accepting on SIGINT/SIGTERM, let in-flight turns finish (bounded by
-    // the run timeout), then disconnect kept sessions so no `claude` process
-    // is left orphaned by the exit.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    tracing::info!(live = state.pool.len(), "shutting down agent sessions");
-    state.shutdown().await;
+
+    // On SIGINT/SIGTERM: stop accepting, let in-flight turns finish, then
+    // close kept sessions and warm spares so no `claude` process outlives the
+    // server. Each phase is bounded by the grace period; whatever is still
+    // running when it elapses is dropped, and the SDK kills its process.
+    let (signal_tx, signal_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = signal_tx.send(true);
+    });
+    let graceful = {
+        let mut rx = signal_rx.clone();
+        async move {
+            let _ = rx.wait_for(|signalled| *signalled).await;
+        }
+    };
+    let grace_elapsed = {
+        let mut rx = signal_rx;
+        async move {
+            let _ = rx.wait_for(|signalled| *signalled).await;
+            tokio::time::sleep(grace).await;
+        }
+    };
+    tokio::select! {
+        served = axum::serve(listener, app).with_graceful_shutdown(graceful) => served?,
+        _ = grace_elapsed => {
+            tracing::warn!(grace_secs = grace.as_secs(), "shutdown grace period elapsed with requests still in flight");
+        }
+    }
+
+    tracing::info!(
+        sessions = state.pool.len(),
+        warm = state.warm.ready(),
+        "closing agent processes"
+    );
+    if tokio::time::timeout(grace, state.shutdown()).await.is_err() {
+        tracing::warn!("some agent processes did not exit in time; they are killed on exit");
+    }
     Ok(())
 }
 

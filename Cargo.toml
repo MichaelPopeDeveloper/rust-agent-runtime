@@ -8,3 +8,9 @@ members = [
 [workspace.package]
 license = "MIT"
 repository = "https://github.com/MichaelPopeDeveloper/rust-agent-runtime"
+
+# The deployable: whole-program optimisation and a stripped binary.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

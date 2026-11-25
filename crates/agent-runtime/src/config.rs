@@ -54,6 +54,17 @@ pub struct Config {
     /// Maximum kept sessions, i.e. idle-but-live `claude` processes
     /// (`AGENT_MAX_SESSIONS`, default 32).
     pub max_sessions: usize,
+    /// Pre-spawned `claude` processes kept ready for fresh runs that use the
+    /// server's default options (`AGENT_WARM_SPARES`, default 1; 0 disables).
+    /// Warming starts with the first agent request, not at startup.
+    pub warm_spares: usize,
+    /// How long a request may wait for a free slot before `429`
+    /// (`AGENT_QUEUE_WAIT_SECS`, default 0: reject immediately).
+    pub queue_wait: Duration,
+    /// After a shutdown signal, how long in-flight turns and process
+    /// teardowns get before the server exits anyway
+    /// (`AGENT_SHUTDOWN_GRACE_SECS`, default 30).
+    pub shutdown_grace: Duration,
 }
 
 impl Default for Config {
@@ -72,6 +83,9 @@ impl Default for Config {
             run_timeout: Duration::from_secs(600),
             session_ttl: Duration::from_secs(300),
             max_sessions: 32,
+            warm_spares: 1,
+            queue_wait: Duration::ZERO,
+            shutdown_grace: Duration::from_secs(30),
         }
     }
 }
@@ -135,6 +149,23 @@ impl Config {
             config.max_sessions = n
                 .parse()
                 .map_err(|_| format!("invalid AGENT_MAX_SESSIONS: {n:?}"))?;
+        }
+        if let Some(n) = non_empty(std::env::var("AGENT_WARM_SPARES").ok()) {
+            config.warm_spares = n
+                .parse()
+                .map_err(|_| format!("invalid AGENT_WARM_SPARES: {n:?}"))?;
+        }
+        if let Some(secs) = non_empty(std::env::var("AGENT_QUEUE_WAIT_SECS").ok()) {
+            config.queue_wait = Duration::from_secs(
+                secs.parse()
+                    .map_err(|_| format!("invalid AGENT_QUEUE_WAIT_SECS: {secs:?}"))?,
+            );
+        }
+        if let Some(secs) = non_empty(std::env::var("AGENT_SHUTDOWN_GRACE_SECS").ok()) {
+            config.shutdown_grace = Duration::from_secs(
+                secs.parse()
+                    .map_err(|_| format!("invalid AGENT_SHUTDOWN_GRACE_SECS: {secs:?}"))?,
+            );
         }
         Ok(config)
     }

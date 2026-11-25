@@ -33,6 +33,7 @@ stream-JSON control protocol as the official SDKs.
   shutdown (terminate then kill).
 - A typed error enum mirroring the Python SDK's exception hierarchy, including a
   `ResultError` carrying the CLI's terminal error payload.
+- `ClaudeSDKClient::is_connected()`: a cheap liveness check (false once the CLI process has exited or closed its output) for reusing idle clients, such as from a pool.
 
 ### Fixed
 

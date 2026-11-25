@@ -53,6 +53,12 @@ impl From<claude_agent_sdk::Error> for ApiError {
     }
 }
 
+impl From<axum::extract::rejection::JsonRejection> for ApiError {
+    fn from(rejection: axum::extract::rejection::JsonRejection) -> Self {
+        ApiError::new(rejection.status(), rejection.body_text())
+    }
+}
+
 impl From<reqwest::Error> for ApiError {
     fn from(err: reqwest::Error) -> Self {
         ApiError::upstream(format!("request to the Messages API failed: {err}"))

@@ -168,8 +168,10 @@ async fn client_multi_turn_session() {
     }
     let options = ClaudeAgentOptions::builder().cli_path(fake_cli()).build();
     let mut client = ClaudeSDKClient::new(options);
+    assert!(!client.is_connected(), "not connected before connect()");
     client.connect().await.expect("connects");
     assert!(client.server_info().is_some(), "initialize response kept");
+    assert!(client.is_connected());
 
     for turn in ["one", "two", "three"] {
         client.query(turn, "default").await.expect("sends");
@@ -186,5 +188,37 @@ async fn client_multi_turn_session() {
         }
         assert_eq!(echoed.as_deref(), Some(format!("echo: {turn}").as_str()));
     }
+    client.disconnect().await;
+    assert!(!client.is_connected(), "not connected after disconnect()");
+}
+
+/// `is_connected` turns false once the CLI process has exited, without the
+/// caller having to send anything.
+#[tokio::test]
+async fn client_detects_a_dead_process() {
+    if !have_python() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let options = ClaudeAgentOptions::builder()
+        .cli_path(fake_cli())
+        .env("CLAUDE_FAKE_EXIT_NONZERO", "1")
+        .build();
+    let mut client = ClaudeSDKClient::new(options);
+    client.connect().await.expect("connects");
+    assert!(client.is_connected());
+
+    // The fake answers this turn and then exits non-zero.
+    client.query("boom", "default").await.expect("sends");
+    {
+        let mut responses = client.receive_response();
+        while responses.next().await.is_some() {}
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while client.is_connected() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!client.is_connected(), "the process exit is visible");
     client.disconnect().await;
 }
