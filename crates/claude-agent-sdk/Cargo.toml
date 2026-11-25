@@ -1,0 +1,59 @@
+[package]
+name = "claude-agent-sdk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Rust SDK for Claude Code: programmatic access to the Claude Agent harness (a port of the Python and TypeScript Claude Agent SDKs)"
+license = "MIT"
+readme = "README.md"
+keywords = ["claude", "anthropic", "agent", "sdk", "claude-code"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "process", "io-util", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+futures = "0.3"
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+memchr = "2"
+jsonschema = { version = "0.63", optional = true, default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+jsonschema = { version = "0.63", default-features = false }
+
+[features]
+default = ["validate"]
+# Validate SDK MCP tool arguments against each tool's JSON Schema before the
+# handler runs (mirrors the Python SDK, which uses the `jsonschema` package).
+validate = ["dep:jsonschema"]
+
+[[example]]
+name = "quick_start"
+[[example]]
+name = "streaming_client"
+[[example]]
+name = "mcp_calculator"
+[[example]]
+name = "hooks"
+[[example]]
+name = "tool_permission_callback"
+[[example]]
+name = "system_prompt"
+[[example]]
+name = "agents"
+[[example]]
+name = "structured_output"
+[[example]]
+name = "stderr_callback"
+
+[[bench]]
+name = "throughput"
+harness = false
