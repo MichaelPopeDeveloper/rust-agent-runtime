@@ -150,6 +150,126 @@ The direct `/messages` routes retry transient upstream failures (`429`, `529`
 overloaded, other `5xx`, connection errors) twice with backoff, honouring
 `retry-after`, and time out rather than hanging on a dead connection.
 
+## Performance
+
+What was measured, how, and what changed. There are two layers: the SDK's
+read path (CPU-bound, benchmarked with `cargo bench -p claude-agent-sdk`) and
+the HTTP runtime's per-request lifecycle (dominated by process spawn and the
+CLI's own API time, measured against the real `claude` CLI).
+
+### Where the time goes
+
+A trivial agent turn ("Reply only with: OK") costs 3.1–3.5 s *inside* the
+CLI: the API round trip plus the CLI's own work. That part is the same for
+every client of the CLI and is outside this code's control, and it varies with
+API latency (the same prompt measured 3.1 s one minute and 6.2 s the next).
+So the figure that matters, and the one the tables below use, is **overhead**:
+the wall-clock time of the HTTP request minus the `duration_ms` the CLI
+reports in its result frame. That is the part this code is responsible for.
+
+### Runtime: per-request overhead against the real CLI
+
+The first version of the runtime spawned a fresh `claude` process for every
+request, waited for it to exit before answering, and had no limits on how
+many ran at once or for how long.
+
+| Path | Overhead before | Overhead now | What changed |
+|---|---|---|---|
+| One-shot `/agent/run`, cold | **2.75 s** (6.04 s wall for 3.29 s of CLI work) | **0.6–0.9 s** | The process exit moved off the response path: the response returns the moment the result arrives, teardown runs in the background while holding the slot. What remains is the spawn + `initialize` handshake. |
+| One-shot `/agent/run`, warm spare | n/a (no spares) | **80–100 ms** | The spawn and handshake already happened in the background (`AGENT_WARM_SPARES`). |
+| Follow-up turn on a kept session | n/a (a fresh process per request) | **10–15 ms** | Same process, same conversation (`keep_session` / `session_id`): no spawn, no handshake, and the model keeps its context. |
+| Follow-up that switches model | n/a | ~0.8 s | The CLI's own model switch; later turns are back to 10–15 ms. |
+
+Put differently: for a workload of short follow-up turns, the runtime went
+from adding roughly 85% on top of the CLI's time to adding well under 1%.
+
+Memory and process count:
+
+| | Before | Now |
+|---|---|---|
+| RSS of one `claude` process during a run | 220–307 MB | the same (it is the CLI) |
+| Processes under load | unbounded: one per in-flight request | at most `AGENT_MAX_CONCURRENT` running + `AGENT_MAX_SESSIONS` kept + `AGENT_WARM_SPARES` warm |
+| A request past the limit | spawns anyway | `429` at once (or after `AGENT_QUEUE_WAIT_SECS`) |
+| A stuck turn | holds its process forever | `504` at `AGENT_RUN_TIMEOUT_SECS`, process terminated |
+| Server exit with live processes | orphaned `claude` processes | all closed, concurrently; measured ~1 s from SIGTERM to exit with two alive, none left |
+| Kept session idle | n/a | reclaimed after `AGENT_SESSION_TTL_SECS` |
+
+Smaller wins on the same path: a streaming consumer that disconnects frees
+its slot immediately rather than at the next message; status polls stay out
+of the request log; the direct `/messages` client retries `429`/`529`/`5xx`
+with backoff and never hangs on a dead connection; the release binary is built
+with LTO and stripped (9.3 MB).
+
+### SDK: the read path
+
+`benches/throughput.rs` feeds the framer and parser synthetic NDJSON in 16 KiB
+reads, the way the pipe delivers it, and compares the first implementation
+("naive": scan the whole pending buffer for each newline, `drain` every line)
+with the shipped one ("optimized": a `start`/`scan` cursor, `memchr` over new
+bytes only, one compaction per drained read). Numbers from this machine; run
+it yourself for yours.
+
+| Scenario | Naive | Optimized | Speedup |
+|---|---|---|---|
+| 200 messages of 64 KiB (12.5 MiB) | 741 MiB/s | 4304 MiB/s | 5.8x |
+| One 8 MiB message | 12.3 MiB/s | 87.5 MiB/s | 7.1x |
+| 5000 messages of ~40 B | 185 MiB/s | 197 MiB/s | ~1x (parse-bound; framing was never the cost here) |
+| Raw bytes → typed `Message`, large | | 4124 MiB/s | moves fields out of the JSON instead of cloning (~9% over the clone version, lower peak memory) |
+| Raw bytes → typed `Message`, small | | 111 MiB/s | |
+| In-process MCP `tools/call`, schema-validated | 6.44 µs/call | 1.41 µs/call | 4.6x (validator and `tools/list` compiled once, 710k calls/s) |
+
+The first row is the common case for tool-heavy agents (file reads, command
+output); the second is a multi-megabyte tool result, where the old framer's
+quadratic rescans dominated. Beyond throughput, the SDK's read path was
+rebuilt around a few invariants worth knowing when you tune the runtime:
+
+- **Control frames are never starved by data.** Permission prompts, hook
+  callbacks and MCP calls bypass the data queue, so a consumer that falls
+  behind cannot stall an answer the CLI is blocked on. Memory for unconsumed
+  data is bounded by a 64 MiB **byte** budget rather than a frame count, which
+  is what keeps it predictable across 40 B stream events and 8 MiB results.
+- **No lock on the hot path.** Only `result` and `system` frames touch
+  bookkeeping state; `assistant`, `user` and `stream_event` frames take no
+  lock at all.
+- **The transport reads lazily** as the engine polls it: no reader task and
+  no intermediate channel hop per frame.
+- **Spawn cost is kept to the process itself.** The child inherits the
+  environment instead of receiving a copied map, and CLI discovery is cached
+  process-wide, so a server that starts many sessions doesn't re-scan `PATH`.
+- **Buffers shrink back** after a huge message instead of pinning that
+  capacity for the life of a session.
+
+### Reproducing the numbers
+
+SDK read path (release build, prints MiB/s and µs/call):
+
+```bash
+cargo bench -p claude-agent-sdk
+```
+
+Runtime overhead, against your own CLI login. Start the server, then time a
+cold run that keeps its session and a follow-up on it; subtract each
+response's `duration_ms` from the wall time:
+
+```bash
+cargo run --release -p agent-runtime
+```
+
+```bash
+time curl -s -X POST localhost:3000/agent/run -H 'content-type: application/json' \
+  -d '{"prompt": "Reply only with: OK", "keep_session": true}'
+```
+
+```bash
+time curl -s -X POST localhost:3000/agent/run -H 'content-type: application/json' \
+  -d '{"prompt": "Reply only with: OK", "session_id": "<session_id from above>"}'
+```
+
+`GET /agent/sessions` shows warm spares, running turns and the counters
+(warm hits vs. spawns, timeouts, `429`s) that tell you whether the limits fit
+your traffic. Note that `total_cost_usd` in a kept session is cumulative, so
+compare per-turn cost by difference.
+
 ## Use the SDK directly
 
 If you want the agent engine in your own Rust program rather than over HTTP,
